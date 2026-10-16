@@ -233,11 +233,16 @@ fn timing_args(mode: FfmpegTimingMode, fps: u32) -> Vec<String> {
     }
 }
 
+/// Legacy is chosen only from a completed help dump that visibly lacks the
+/// modern options. A failed probe (spawn error, non-zero exit, timeout, or no
+/// parseable help text) must keep the modern args: `-vsync` is deprecated
+/// since FFmpeg 5.1 and may not be accepted by newer builds, so falling back
+/// to it on a failed probe would kill the encoder there — worse than guessing.
 fn timing_mode_from_probe(success: bool, stdout: &[u8], stderr: &[u8]) -> FfmpegTimingMode {
-    if !success { return FfmpegTimingMode::Legacy; }
     let mut help = Vec::with_capacity(stdout.len() + stderr.len());
     help.extend_from_slice(stdout);
     help.extend_from_slice(stderr);
+    if !success || help.is_empty() { return FfmpegTimingMode::Modern; }
     timing_mode_from_help(&String::from_utf8_lossy(&help))
 }
 
@@ -476,8 +481,10 @@ async fn read_encoder_with(
     }
     command.args(encoder_options(&settings, encoder, &gop));
     // x11grab paces against an absolute schedule; after a capture stall it grabs
-    // back-to-back to "catch up" (measured 69 frames in 200ms). Passthrough
-    // timestamps drop those same-slot frames instead of encoding a burst.
+    // back-to-back to "catch up" (measured 69 frames in 200ms). vfr on a 1/FPS
+    // timebase drops those same-slot frames instead of encoding a burst. The
+    // legacy -vsync 0 path (FFmpeg 4.x) passes catch-up frames straight through
+    // and encodes the whole burst; a known degradation on old FFmpeg.
     // Native Wayland: the capture process writes straight into the encoder's stdin;
     // relaying 33 MB 4K frames through this process cost a full extra copy per frame.
     let mut native_capture=None;
@@ -802,12 +809,15 @@ mod tests {
     }
 
     #[test]
-    fn timing_probe_failures_fall_back_without_using_partial_help() {
+    fn timing_probe_failure_keeps_modern_args() {
         let modern = b"  -fps_mode mode\n  -enc_time_base ratio\n";
-        assert_eq!(timing_mode_from_probe(true, modern, &[]), FfmpegTimingMode::Modern);
-        assert_eq!(timing_mode_from_probe(false, modern, &[]), FfmpegTimingMode::Legacy);
+        // Legacy is only confirmed from a completed help dump that lacks the options.
         assert_eq!(timing_mode_from_probe(true, b"", b"  -fps_mode mode\n"), FfmpegTimingMode::Legacy);
-        assert_eq!(timing_mode_from_probe(false, &[], &[]), FfmpegTimingMode::Legacy);
+        // Any probe failure keeps the modern args (-vsync is deprecated on new FFmpeg).
+        assert_eq!(timing_mode_from_probe(false, modern, &[]), FfmpegTimingMode::Modern);
+        assert_eq!(timing_mode_from_probe(false, &[], &[]), FfmpegTimingMode::Modern);
+        assert_eq!(timing_mode_from_probe(true, &[], &[]), FfmpegTimingMode::Modern);
+        assert_eq!(timing_mode_from_probe(true, modern, &[]), FfmpegTimingMode::Modern);
     }
 
     #[tokio::test]
